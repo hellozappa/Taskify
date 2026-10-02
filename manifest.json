@@ -1,0 +1,10 @@
+{
+  "id": "taskify",
+  "name": "Taskify",
+  "version": "0.1.0",
+  "minAppVersion": "1.8.0",
+  "description": "Creates Tasks-plugin tasks from a configurable note property.",
+  "author": "Chris Zappa",
+  "authorUrl": "https://github.com/hellozappa",
+  "isDesktopOnly": false
+}
