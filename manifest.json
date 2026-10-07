@@ -1,9 +1,9 @@
 {
   "id": "taskify",
   "name": "Taskify",
-  "version": "0.1.0",
-  "minAppVersion": "1.8.0",
-  "description": "Creates Tasks-plugin tasks from a configurable note property.",
+  "version": "0.2.0",
+  "minAppVersion": "1.12.2",
+  "description": "Creates native TaskNotes tasks from a configurable note checkbox.",
   "author": "Chris Zappa",
   "authorUrl": "https://github.com/hellozappa",
   "isDesktopOnly": false

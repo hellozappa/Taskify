@@ -1,8 +1,8 @@
 {
   "name": "taskify",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "private": true,
-  "description": "Creates Tasks-plugin tasks from a configurable note property.",
+  "description": "Creates native TaskNotes tasks from a configurable note checkbox.",
   "type": "module",
   "scripts": {
     "build": "tsc --noEmit --skipLibCheck && node esbuild.config.mjs production",
@@ -13,7 +13,7 @@
   "keywords": [
     "obsidian",
     "obsidian-plugin",
-    "obsidian-tasks"
+    "tasknotes"
   ],
   "author": "Chris Zappa",
   "license": "MIT",

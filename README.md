@@ -1,53 +1,39 @@
 # Taskify
 
-Taskify creates a Tasks-plugin-compatible task from a Boolean frontmatter property on an Obsidian note.
-
-When the configured property is checked, Taskify writes a task such as this to its own Markdown task-store file:
-
-```markdown
-- [ ] [[Example Note]]
-```
-
-The task is then available to any existing Tasks query. The source note is never given a task line.
+Taskify creates a native [TaskNotes](https://tasknotes.dev/obsidian/javascript-api/) task when a Boolean property on an Obsidian note is checked. The task's title is the source note's name, and a qualified wikilink connects it to the source note. No task line is added to the source note.
 
 ## Setup
 
-1. Enable the Tasks plugin.
-2. In **Taskify** settings, choose either `task` or `todo` as the source property.
-3. Set the vault-relative task-store path, such as `Planning/Taskify Tasks.md`.
-   - Its filename is its title.
-   - With Obsidian inline titles enabled, Obsidian displays that filename as the title.
-   - With inline titles disabled, Taskify writes the same title as an H1.
-4. Add the property to a note with the **Add Taskify task property** command or the ribbon action, or add it manually in Properties.
-5. Check the property to create the task.
+1. Enable TaskNotes with runtime API v1 (tested with TaskNotes 4.13.8; Obsidian 1.12.2 or newer).
+2. Create an ordinary project note in its own folder, with a `Tasks` subfolder.
+3. In TaskNotes settings, set the task folder to `{{projectFolder}}/Tasks`. An exact folder matching the selected project's Tasks folder also works. Taskify refuses other folder configurations instead of placing tasks somewhere unexpected.
+4. In Taskify settings, select `todo` (default) or `task` and the exact project note path. The default is `Projects/Review/Review.md`.
+5. Add the property manually, through a template, or with **Add Taskify task property** in the command palette or ribbon. Check it to create a task.
 
-Taskify does not create a dashboard or a Tasks query. Point an existing query at the task-store file if you want a dedicated view.
-
-## Completion statuses
-
-Tasks controls the normal status transition when a task checkbox is clicked. Taskify defaults to the standard completed status, `[x]`.
-
-To use a custom completed status, such as `[r]` for Read:
-
-1. In Tasks settings, add `r` as a custom status with type **Done**.
-2. Configure Tasks so the status transition you want ends in `r`.
-3. Set Taskify’s **Completed task status** to `r`.
-
-If Tasks first writes `[x]`, Taskify changes only its own generated task to the configured symbol. Taskify deliberately does not alter Tasks’ settings or custom-status definitions.
+TaskNotes handles task identification, property mappings, template content, timestamps, collision-safe filenames, and configured status, priority, and date defaults. Taskify does not change TaskNotes settings or require its HTTP API.
 
 ## Behavior
 
-- Existing Notes can gain the property manually or through Taskify’s command and ribbon action.
-- Notes in any folder named `Templates` are ignored when their property changes; templates can still contain an unchecked property for future notes.
-- Clearing the source property removes its open generated task.
-- Completed generated tasks remain in the task-store note as history.
-- Taskify tracks only tasks it created. It does not alter manually written tasks.
+- Checking the property creates one task per source note, inside the selected project's Tasks folder. Editing the source note again does not create duplicates.
+- Unchecking the property archives the generated task, including completed tasks. Archive tags and folder movement follow TaskNotes settings; no task is deleted.
+- Rechecking restores the same task to its original Tasks folder. Its status, completion history, body, and other properties remain intact. A completed task is not reopened.
+- Completion is managed in TaskNotes. Configure a custom status such as **Read** there. Taskify does not translate status characters or change the source checkbox on completion.
+- Taskify tracks source and task renames, including folder moves. Generated notes contain a `taskifySource` wikilink property for ownership recovery as well as a source link in the body when the configured template permits it.
+- Generated notes and existing TaskNotes tasks cannot spawn more tasks. Notes in folders named `Templates` are ignored.
+- A missing dependency, project note, incompatible folder, or temporarily unindexed tracked task produces a notice instead of silently falling back or creating a duplicate.
+- Taskify does not scan all checked notes on startup. Check a note's property to begin using the new workflow; this avoids an automatic bulk migration on upgrade.
+- Changing the project setting affects new tasks, not previously generated tasks. Changing the property setting does not migrate existing properties.
+
+## Upgrading from the checklist version
+
+The old Markdown task store, its checklist entries, and legacy saved settings are preserved. Version 0.2.0 no longer writes checklist tasks or normalizes Obsidian Tasks status symbols. Existing checklist entries are not automatically converted into TaskNotes notes. New tasks are displayed in TaskNotes views/Bases rather than Obsidian Tasks queries.
 
 ## Development
 
 ```bash
 npm install
-npm run typecheck
 npm test
 npm run build
 ```
+
+The original checklist-format helpers/tests remain as legacy source coverage and are not part of the runtime entry point. Native TaskNotes synchronization has its own regression suite. Build checks do not prove installed Obsidian behavior; installation/reload and a vault smoke test are separate steps.

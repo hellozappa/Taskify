@@ -1,66 +1,30 @@
+import { Notice, Plugin, TAbstractFile, TFile, TFolder } from "obsidian";
+import { DEFAULT_SETTINGS, TaskifySettingTab, type TaskifySettings } from "./settings";
 import {
-  App,
-  CachedMetadata,
-  Notice,
-  Plugin,
-  TAbstractFile,
-  TFile,
-  TFolder,
-  Vault,
-} from "obsidian";
+  notePath, projectTaskFolder, renamedPath, requireTaskNotesApi, synchronizeTaskNote,
+  type TaskNoteRecord, type TaskNotesApi,
+} from "./tasknotes";
 
-import {
-  DEFAULT_SETTINGS,
-  TaskifySettingTab,
-  type TaskifySettings,
-} from "./settings";
-import {
-  appendManagedTask,
-  findManagedTask,
-  removeManagedTask,
-  renderTaskStoreTitle,
-  replaceManagedTaskStatus,
-  synchronizeTaskStoreTitle,
-  taskStoreTitleFromPath,
-  type ManagedTask,
-} from "./task-store";
-
-type TaskRecord = {
-  id: string;
-  sourcePath: string;
-  storagePath: string;
-};
-
-type StoredPluginData = Partial<TaskifySettings> & {
-  taskRecords?: TaskRecord[];
-};
-
-type VaultWithConfiguration = Vault & {
-  getConfig?: (key: string) => unknown;
+type StoredPluginData = Record<string, unknown> & Partial<TaskifySettings> & {
+  taskNoteRecords?: TaskNoteRecord[];
 };
 
 export default class TaskifyPlugin extends Plugin {
-  settings: TaskifySettings = DEFAULT_SETTINGS;
-  private taskRecords: TaskRecord[] = [];
+  settings: TaskifySettings = { ...DEFAULT_SETTINGS };
+  private records: TaskNoteRecord[] = [];
+  private storedData: StoredPluginData = {};
   private writeQueue: Promise<void> = Promise.resolve();
+  private stopped = false;
 
   async onload(): Promise<void> {
     await this.loadPluginData();
-
     this.addSettingTab(new TaskifySettingTab(this.app, this));
     this.addCommand({
-      id: "add-taskify-property",
-      name: "Add Taskify task property",
+      id: "add-taskify-property", name: "Add Taskify task property",
       checkCallback: (checking) => {
         const file = this.app.workspace.getActiveFile();
-        if (!isMarkdownFile(file)) {
-          return false;
-        }
-
-        if (!checking) {
-          void this.addTaskProperty(file);
-        }
-
+        if (!isMarkdownFile(file)) return false;
+        if (!checking) void this.addTaskProperty(file);
         return true;
       },
     });
@@ -70,39 +34,21 @@ export default class TaskifyPlugin extends Plugin {
         new Notice("Open a Markdown note before adding a Taskify property.");
         return;
       }
-
       void this.addTaskProperty(file);
     });
-
-    this.registerEvent(
-      this.app.metadataCache.on(
-        "changed",
-        (file: TFile, _data: string, cache: CachedMetadata) => {
-          this.enqueue(async () => {
-            await this.handleMetadataChange(file, cache);
-          });
-        },
-      ),
-    );
-    this.registerEvent(
-      this.app.vault.on("modify", (file) => {
-        if (isMarkdownFile(file)) {
-          this.enqueue(async () => {
-            await this.normalizeCompletedTasksInFile(file);
-          });
-        }
-      }),
-    );
-    this.registerEvent(
-      this.app.vault.on("rename", (file, oldPath) => {
-        if (isMarkdownFile(file)) {
-          this.enqueue(async () => {
-            await this.updateRenamedRecordPaths(file, oldPath);
-          });
-        }
-      }),
-    );
+    this.registerEvent(this.app.metadataCache.on("changed", (file, _data, cache) => {
+      if (cache.frontmatter?.[this.settings.propertyName] === true ||
+          cache.frontmatter?.[this.settings.propertyName] === false) {
+        this.enqueue(() => this.handleMetadataChange(file));
+      }
+    }));
+    this.registerEvent(this.app.vault.on("rename", (file, oldPath) => {
+      this.enqueue(() => this.updateRenamedPaths(file, oldPath));
+    }));
+    // Deliberately no startup scan: enabling/upgrading Taskify is not a bulk migration.
   }
+
+  onunload(): void { this.stopped = true; }
 
   async updateSettings(changes: Partial<TaskifySettings>): Promise<void> {
     this.settings = { ...this.settings, ...changes };
@@ -111,289 +57,140 @@ export default class TaskifyPlugin extends Plugin {
 
   private async addTaskProperty(file: TFile): Promise<void> {
     const propertyName = this.settings.propertyName;
-    const cache = this.app.metadataCache.getFileCache(file);
-    if (cache?.frontmatter?.[propertyName] !== undefined) {
-      new Notice(`This note already has a ${propertyName} property.`);
-      return;
-    }
-
     try {
-      await this.app.fileManager.processFrontMatter(
-        file,
-        (frontmatter: Record<string, unknown>) => {
-          frontmatter[propertyName] = false;
-        },
-      );
-      new Notice(`Added ${propertyName} to ${file.basename}.`);
-    } catch (error) {
-      this.reportError("Could not add the Taskify property", error);
-    }
+      await this.app.fileManager.processFrontMatter(file, (frontmatter: Record<string, unknown>) => {
+        if (frontmatter[propertyName] === undefined) frontmatter[propertyName] = false;
+      });
+      new Notice(`The ${propertyName} property is ready on ${file.basename}.`);
+    } catch (error) { this.reportError("Could not add the Taskify property", error); }
   }
 
-  private async handleMetadataChange(
-    file: TFile,
-    cache: CachedMetadata,
-  ): Promise<void> {
-    if (this.isTaskStorageFile(file) || isTemplateFile(file)) {
-      return;
-    }
-
-    const value = cache.frontmatter?.[this.settings.propertyName];
-    if (value === true) {
-      await this.ensureTaskForFile(file);
-      return;
-    }
-
-    if (value === false) {
-      await this.removeOpenTaskForFile(file);
-    }
-  }
-
-  private async ensureTaskForFile(file: TFile): Promise<void> {
-    const existingRecord = this.findRecordForSource(file.path);
-    if (existingRecord !== null) {
-      const storageFile = await this.getTaskStorageFile(existingRecord.storagePath);
-      const existingMarkdown = await this.app.vault.read(storageFile);
-      if (findManagedTask(existingMarkdown, existingRecord.id) !== null) {
-        return;
-      }
-
-      const restored = appendManagedTask(
-        existingMarkdown,
-        this.createManagedTask(existingRecord.id, file),
-      );
-      await this.app.vault.modify(storageFile, restored);
-      return;
-    }
-
-    const storagePath = this.taskStoragePath();
-    const storageFile = await this.getTaskStorageFile(storagePath);
-    const record: TaskRecord = {
-      id: crypto.randomUUID(),
-      sourcePath: file.path,
-      storagePath,
+  private taskNotesApi(): TaskNotesApi {
+    const app = this.app as typeof this.app & {
+      plugins: { getPlugin(id: string): { api?: unknown } | null };
     };
-    const markdown = await this.app.vault.read(storageFile);
-    await this.app.vault.modify(
-      storageFile,
-      appendManagedTask(markdown, this.createManagedTask(record.id, file)),
-    );
-    this.taskRecords.push(record);
-    await this.savePluginData();
+    return requireTaskNotesApi(app.plugins.getPlugin("tasknotes")?.api);
   }
 
-  private async removeOpenTaskForFile(file: TFile): Promise<void> {
-    const record = this.findRecordForSource(file.path);
-    if (record === null) {
-      return;
-    }
-
-    const storageFile = await this.getTaskStorageFile(record.storagePath);
-    const markdown = await this.app.vault.read(storageFile);
-    const task = findManagedTask(markdown, record.id);
-    if (task === null || this.isCompletedStatus(task.statusSymbol)) {
-      return;
-    }
-
-    await this.app.vault.modify(storageFile, removeManagedTask(markdown, record.id));
-    this.taskRecords = this.taskRecords.filter((candidate) => candidate.id !== record.id);
-    await this.savePluginData();
+  private async handleMetadataChange(file: TFile): Promise<void> {
+    if (this.stopped || !isMarkdownFile(file) || !this.app.vault.getAbstractFileByPath(file.path)) return;
+    const cache = this.app.metadataCache.getFileCache(file);
+    if (isTemplateFile(file) || cache?.frontmatter?.taskifySource !== undefined) return;
+    const value = cache?.frontmatter?.[this.settings.propertyName];
+    if (value !== true && value !== false) return;
+    if (value === false && !this.records.some((record) => record.sourcePath === file.path) &&
+        this.sourceTaskFiles(file.path).length === 0) return;
+    const api = this.taskNotesApi();
+    await api.lifecycle.ready();
+    if (this.stopped) return;
+    await synchronizeTaskNote(api, {
+      records: this.records,
+      save: () => this.savePluginData(),
+      fileExists: (path) => this.app.vault.getAbstractFileByPath(path) instanceof TFile,
+      findTask: (path) => this.findTaskBySource(api, path),
+      prepareProject: () => this.prepareProject(),
+      ensureFolder: (path) => this.ensureFolder(path),
+    }, { path: file.path, title: file.basename }, value);
   }
 
-  private async normalizeCompletedTasksInFile(file: TFile): Promise<void> {
-    const records = this.taskRecords.filter(
-      (record) => record.storagePath === file.path,
-    );
-    if (records.length === 0) {
-      return;
+  private async findTaskBySource(api: TaskNotesApi, sourcePath: string): Promise<TaskNoteRecord | null> {
+    const matches = this.sourceTaskFiles(sourcePath);
+    if (matches.length > 1) throw new Error(`Multiple Taskify tasks link to ${sourcePath}; resolve the duplicate task notes first.`);
+    const file = matches[0];
+    if (!file) return null;
+    if (!await api.tasks.get(file.path)) {
+      throw new Error(`TaskNotes has not indexed ${file.path}; no duplicate was created.`);
     }
-
-    const desiredStatus = this.completedStatusSymbol();
-    if (desiredStatus === "x") {
-      return;
-    }
-
-    const markdown = await this.app.vault.read(file);
-    let updatedMarkdown = markdown;
-    for (const record of records) {
-      const task = findManagedTask(updatedMarkdown, record.id);
-      if (task?.statusSymbol === "x") {
-        updatedMarkdown = replaceManagedTaskStatus(
-          updatedMarkdown,
-          record.id,
-          desiredStatus,
-        );
-      }
-    }
-
-    if (updatedMarkdown !== markdown) {
-      await this.app.vault.modify(file, updatedMarkdown);
-    }
+    const taskFolder = projectTaskFolder(notePath(this.settings.projectNotePath));
+    return { sourcePath, taskPath: file.path, taskFolder };
   }
 
-  private async getTaskStorageFile(storagePath: string): Promise<TFile> {
-    const existing = this.app.vault.getAbstractFileByPath(storagePath);
-    if (existing instanceof TFile) {
-      await this.synchronizeTaskStorageTitle(existing);
-      return existing;
+  private sourceTaskFiles(sourcePath: string): TFile[] {
+    const matches: TFile[] = [];
+    for (const file of this.app.vault.getMarkdownFiles()) {
+      if (isTemplateFile(file)) continue;
+      const link = this.app.metadataCache.getFileCache(file)?.frontmatter?.taskifySource;
+      if (typeof link !== "string") continue;
+      const match = /^\[\[([^|\]]+)(?:\|[^\]]*)?\]\]$/.exec(link);
+      if (!match) continue;
+      const source = this.app.metadataCache.getFirstLinkpathDest(match[1], file.path);
+      if (source?.path === sourcePath) matches.push(file);
     }
-
-    if (existing !== null) {
-      throw new Error(`Taskify storage path is not a Markdown file: ${storagePath}`);
-    }
-
-    await this.ensureParentFolders(storagePath);
-    return this.app.vault.create(
-      storagePath,
-      renderTaskStoreTitle(
-        taskStoreTitleFromPath(storagePath),
-        this.inlineTitlesEnabled(),
-      ),
-    );
+    return matches;
   }
 
-  private async synchronizeTaskStorageTitle(file: TFile): Promise<void> {
-    const markdown = await this.app.vault.read(file);
-    const updatedMarkdown = synchronizeTaskStoreTitle(
-      markdown,
-      taskStoreTitleFromPath(file.path),
-      this.inlineTitlesEnabled(),
-    );
-    if (updatedMarkdown !== markdown) {
-      await this.app.vault.modify(file, updatedMarkdown);
+  private async prepareProject(): Promise<{ path: string; folder: string }> {
+    const path = notePath(this.settings.projectNotePath);
+    const project = this.app.vault.getAbstractFileByPath(path);
+    if (!isMarkdownFile(project)) throw new Error(`Create/select the existing project note ${path} in Taskify settings first.`);
+    const folder = projectTaskFolder(path);
+    await this.ensureFolder(folder);
+    return { path, folder };
+  }
+
+  private async ensureFolder(path: string): Promise<void> {
+    // Validate before creating folders; tracking records are persisted user data.
+    const validated = notePath(`${path}/folder-validation.md`);
+    if (!validated.endsWith("/folder-validation.md")) throw new Error("Invalid task folder.");
+    let current = "";
+    for (const part of path.split("/")) {
+      current = current ? `${current}/${part}` : part;
+      const existing = this.app.vault.getAbstractFileByPath(current);
+      if (existing === null) await this.app.vault.createFolder(current);
+      else if (!(existing instanceof TFolder)) throw new Error(`Cannot create a task folder at ${current}.`);
     }
   }
 
-  private async ensureParentFolders(storagePath: string): Promise<void> {
-    const pathSegments = storagePath.split("/");
-    pathSegments.pop();
-    let parentPath = "";
-    for (const segment of pathSegments) {
-      parentPath = parentPath.length === 0 ? segment : `${parentPath}/${segment}`;
-      const existing = this.app.vault.getAbstractFileByPath(parentPath);
-      if (existing === null) {
-        await this.app.vault.createFolder(parentPath);
-      } else if (!(existing instanceof TFolder)) {
-        throw new Error(`Taskify cannot create a folder at ${parentPath}.`);
-      }
-    }
-  }
-
-  private async updateRenamedRecordPaths(
-    file: TFile,
-    oldPath: string,
-  ): Promise<void> {
+  private async updateRenamedPaths(file: TAbstractFile, oldPath: string): Promise<void> {
     let changed = false;
-    this.taskRecords = this.taskRecords.map((record) => {
-      if (record.sourcePath === oldPath) {
-        changed = true;
-        return { ...record, sourcePath: file.path };
+    for (const record of this.records) {
+      for (const key of ["sourcePath", "taskPath", "taskFolder"] as const) {
+        const next = renamedPath(record[key], oldPath, file.path);
+        if (next !== record[key]) { record[key] = next; changed = true; }
       }
-      if (record.storagePath === oldPath) {
-        changed = true;
-        return { ...record, storagePath: file.path };
-      }
-      return record;
-    });
-
-    if (changed) {
-      await this.savePluginData();
     }
-  }
-
-  private createManagedTask(id: string, file: TFile): ManagedTask {
-    return {
-      id,
-      sourcePath: file.path,
-      sourceTitle: file.basename,
-      statusSymbol: " ",
-    };
-  }
-
-  private findRecordForSource(sourcePath: string): TaskRecord | null {
-    return (
-      this.taskRecords.find((record) => record.sourcePath === sourcePath) ?? null
-    );
-  }
-
-  private isCompletedStatus(statusSymbol: string): boolean {
-    return statusSymbol === "x" || statusSymbol === this.completedStatusSymbol();
-  }
-
-  private isTaskStorageFile(file: TFile): boolean {
-    return this.taskRecords.some((record) => record.storagePath === file.path) ||
-      file.path === this.taskStoragePath();
-  }
-
-  private inlineTitlesEnabled(): boolean {
-    const vault = this.app.vault as VaultWithConfiguration;
-    return vault.getConfig?.("showInlineTitle") === true;
-  }
-
-  private taskStoragePath(): string {
-    const configuredPath = this.settings.taskFilePath.trim();
-    if (configuredPath.length === 0) {
-      throw new Error("Set a Taskify task storage file in settings before creating tasks.");
+    const projectPath = renamedPath(this.settings.projectNotePath, oldPath, file.path);
+    if (projectPath !== this.settings.projectNotePath) {
+      this.settings.projectNotePath = projectPath;
+      changed = true;
     }
-
-    const normalizedPath = configuredPath
-      .replace(/\\/g, "/")
-      .replace(/^\/+/, "")
-      .replace(/\/+/g, "/");
-    if (normalizedPath.split("/").some((segment) => segment === "..")) {
-      throw new Error("The Taskify task storage path cannot contain '..'.");
-    }
-
-    return normalizedPath.toLowerCase().endsWith(".md")
-      ? normalizedPath
-      : `${normalizedPath}.md`;
-  }
-
-  private completedStatusSymbol(): string {
-    const statusSymbol = this.settings.completedStatusSymbol.trim();
-    if (Array.from(statusSymbol).length !== 1) {
-      throw new Error("The Taskify completed task status must be one character.");
-    }
-
-    return statusSymbol;
+    if (changed) await this.savePluginData();
   }
 
   private async loadPluginData(): Promise<void> {
-    const storedData = (await this.loadData()) as StoredPluginData | null;
+    this.storedData = (await this.loadData()) as StoredPluginData | null ?? {};
     this.settings = {
-      ...DEFAULT_SETTINGS,
-      propertyName:
-        storedData?.propertyName === "todo" ? "todo" : DEFAULT_SETTINGS.propertyName,
-      taskFilePath: storedData?.taskFilePath ?? DEFAULT_SETTINGS.taskFilePath,
-      completedStatusSymbol:
-        storedData?.completedStatusSymbol ?? DEFAULT_SETTINGS.completedStatusSymbol,
+      propertyName: this.storedData.propertyName === "task" ? "task" : "todo",
+      projectNotePath: typeof this.storedData.projectNotePath === "string"
+        ? this.storedData.projectNotePath : DEFAULT_SETTINGS.projectNotePath,
     };
-    this.taskRecords = storedData?.taskRecords ?? [];
+    this.records = Array.isArray(this.storedData.taskNoteRecords)
+      ? this.storedData.taskNoteRecords.filter((record) =>
+        typeof record?.sourcePath === "string" && typeof record?.taskPath === "string" &&
+        typeof record?.taskFolder === "string") : [];
   }
 
   private async savePluginData(): Promise<void> {
-    await this.saveData({ ...this.settings, taskRecords: this.taskRecords });
+    // Preserve unknown/legacy settings and checklist records; never migrate them silently.
+    await this.saveData({ ...this.storedData, ...this.settings, taskNoteRecords: this.records });
   }
 
   private enqueue(operation: () => Promise<void>): void {
-    this.writeQueue = this.writeQueue
-      .then(operation)
-      .catch((error: unknown) => {
-        this.reportError("Taskify could not synchronize a task", error);
-      });
+    this.writeQueue = this.writeQueue.then(async () => {
+      if (!this.stopped) await operation();
+    }).catch((error: unknown) => this.reportError("Taskify could not synchronize a task", error));
   }
 
   private reportError(summary: string, error: unknown): void {
     const detail = error instanceof Error ? error.message : String(error);
     console.error(`${summary}: ${detail}`);
-    new Notice(`${summary}: ${detail}`);
+    if (!this.stopped) new Notice(`${summary}: ${detail}`);
   }
 }
 
 function isMarkdownFile(file: TAbstractFile | null): file is TFile {
   return file instanceof TFile && file.extension === "md";
 }
-
 function isTemplateFile(file: TFile): boolean {
   return file.path.split("/").some((segment) => segment.toLowerCase() === "templates");
 }
