@@ -13,7 +13,10 @@ export interface TaskNotesApi {
   apiVersion: number;
   hasCapability(capability: string): boolean;
   lifecycle: { ready(): Promise<void> };
-  settings: { snapshot(): { tasksFolder: string } };
+  settings: { snapshot(): {
+    fieldMapping: { projects: string };
+    taskCreationDefaults: { useBodyTemplate: boolean; bodyTemplate: string };
+  } };
   tasks: {
     get(path: string): Promise<TaskNote | null>;
     create(data: TaskCreation, context: MutationContext): Promise<TaskNote>;
@@ -31,27 +34,41 @@ export function requireTaskNotesApi(value: unknown): TaskNotesApi {
   return api as TaskNotesApi;
 }
 
-export function notePath(value: string): string {
-  const path = value.trim().replace(/\\/g, "/");
+export const TASK_TEMPLATE_PATH = "Templates/_Task.md";
+
+export function folderPath(value: string): string {
+  const path = value.trim().replace(/\\/g, "/").replace(/\/+$/, "");
   if (!path || path.startsWith("/") || path.split("/").some((part) => !part || part === "." || part === "..") || /[\[\]|#\r\n]/.test(path)) {
-    throw new Error("Use a vault-relative Markdown note path without aliases, headings, or relative segments.");
+    throw new Error("Use a vault-relative folder path without aliases, headings, or relative segments.");
   }
-  return path.endsWith(".md") ? path : `${path}.md`;
+  return path;
 }
 
-export function projectTaskFolder(projectPath: string): string {
-  const path = notePath(projectPath);
-  const slash = path.lastIndexOf("/");
-  if (slash < 0) throw new Error("The project note must be inside its project folder.");
-  return `${path.slice(0, slash)}/Tasks`;
+export function migrateTaskFolder(
+  data: { taskFolderPath?: unknown; projectNotePath?: unknown },
+  kind: (path: string) => "folder" | "file" | null,
+): string {
+  if (typeof data.taskFolderPath === "string") return data.taskFolderPath;
+  if (typeof data.projectNotePath !== "string") return "Projects/Review/Tasks";
+  let legacy: string;
+  try { legacy = folderPath(data.projectNotePath); }
+  catch { return ""; } // Keep the settings screen usable for an invalid legacy value.
+  // Preserve an actual folder entered into the old, incorrectly note-only UI.
+  if (kind(legacy) === "folder") return legacy;
+  const stem = legacy.replace(/\.md$/i, "");
+  if (kind(stem) === "folder") return stem;
+  // A verified old project note maps to its existing parent's Tasks folder.
+  if (kind(legacy.endsWith(".md") ? legacy : `${legacy}.md`) === "file") {
+    const slash = legacy.lastIndexOf("/");
+    if (slash >= 0) return `${legacy.slice(0, slash)}/Tasks`;
+  }
+  return ""; // Ambiguous/missing paths require a setting, never a guessed destination.
 }
 
-export function assertCreationFolder(template: string, projectPath: string): void {
-  const path = notePath(projectPath);
-  const folder = path.slice(0, path.lastIndexOf("/"));
-  const expanded = template.trim().replace(/\{\{projectFolder\}\}/g, folder).replace(/\/+$/, "");
-  if (expanded !== projectTaskFolder(path)) {
-    throw new Error("Set TaskNotes’ task folder to {{projectFolder}}/Tasks (or this project's exact Tasks folder). Taskify will not create a task in another folder.");
+export function assertTaskTemplate(defaults: { useBodyTemplate: boolean; bodyTemplate: string }): void {
+  const path = defaults.bodyTemplate.trim().replace(/\\/g, "/").replace(/\.md$/i, "");
+  if (!defaults.useBodyTemplate || path !== TASK_TEMPLATE_PATH.replace(/\.md$/, "")) {
+    throw new Error(`Enable TaskNotes' body template and select ${TASK_TEMPLATE_PATH}. Taskify will not create a task using a different template.`);
   }
 }
 
@@ -73,8 +90,10 @@ export interface TaskNoteHost {
   save(): Promise<void>;
   fileExists(path: string): boolean;
   findTask(sourcePath: string): Promise<TaskNoteRecord | null>;
-  prepareProject(): Promise<{ path: string; folder: string }>;
+  prepareTaskFolder(): Promise<string>;
+  projectLink(): string;
   ensureFolder(path: string): Promise<void>;
+  watchTaskPath?(path: string): () => string;
 }
 
 /** Call through a serialized queue: one source note has one native task note. */
@@ -106,8 +125,9 @@ export async function synchronizeTaskNote(
 
   if (!checked) {
     if (task && record && !task.archived) {
+      const actualPath = host.watchTaskPath?.(task.path);
       const archived = await api.tasks.archive(task.path, true, context);
-      record.taskPath = archived.path;
+      record.taskPath = actualPath?.() ?? archived.path;
       record.restorePending = false;
       await host.save();
     }
@@ -119,8 +139,9 @@ export async function synchronizeTaskNote(
       await host.ensureFolder(record.taskFolder);
       record.restorePending = true;
       await host.save();
+      const actualPath = host.watchTaskPath?.(task.path);
       const restored = await api.tasks.archive(task.path, false, context);
-      record.taskPath = restored.path;
+      record.taskPath = actualPath?.() ?? restored.path;
       await host.save(); // Persist before any optional move can fail.
     }
     // Unarchive can leave a note in the archive directory. Restore its folder,
@@ -134,21 +155,34 @@ export async function synchronizeTaskNote(
     return;
   }
 
-  const project = await host.prepareProject();
-  assertCreationFolder(api.settings.snapshot().tasksFolder, project.path);
+  const settings = api.settings.snapshot();
+  assertTaskTemplate(settings.taskCreationDefaults);
+  const folder = await host.prepareTaskFolder();
+  const projects = [host.projectLink()];
   const link = sourceLink(source.path, source.title);
   const created = await api.tasks.create({
     title: source.title,
     details: link,
-    projects: [`[[${project.path.replace(/\.md$/, "")}]]`],
-    customFrontmatter: { taskifySource: link },
+    projects,
+    // Override the template's empty relationship with the selected project,
+    // using the live mapped property as well as the logical API field.
+    customFrontmatter: { [settings.fieldMapping.projects]: projects, taskifySource: link },
   }, context);
-  const next = { sourcePath: source.path, taskPath: created.path, taskFolder: project.folder };
+  const next: TaskNoteRecord = { sourcePath: source.path, taskPath: created.path, taskFolder: folder };
+  if (created.path.slice(0, created.path.lastIndexOf("/")) !== folder) next.restorePending = true;
   if (record) Object.assign(record, next);
   else host.records.push(next);
   await host.save(); // Retain ownership even if a postcondition fails.
-  if (created.path.slice(0, created.path.lastIndexOf("/")) !== project.folder) {
-    throw new Error(`TaskNotes created ${created.path} outside ${project.folder}. The task was retained and tracked; check TaskNotes folder settings.`);
+  if (next.restorePending) {
+    const moved = await api.tasks.move(created.path, folder, context);
+    // Keep the same record object: vault rename events may run while moving.
+    const tracked = record ?? host.records[host.records.length - 1];
+    tracked.taskPath = moved.path;
+    tracked.restorePending = moved.path.slice(0, moved.path.lastIndexOf("/")) !== folder;
+    await host.save();
+    if (tracked.restorePending) {
+      throw new Error(`TaskNotes did not move the task to ${folder}. The existing task remains tracked; no duplicate was created.`);
+    }
   }
 }
 

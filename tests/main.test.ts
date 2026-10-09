@@ -33,8 +33,10 @@ function file(path: string): TFile {
 
 function fixture() {
   const source = file("Library/Example.md");
+  const template = file("Templates/_Task.md");
+  const destination = new (TFolder as unknown as new (path: string) => TFolder)("Projects/Review/Tasks");
   const project = file("Projects/Review/Review.md");
-  const files = new Map<string, TFile | TFolder>([[source.path, source], [project.path, project]]);
+  const files = new Map<string, TFile | TFolder>([[source.path, source], [template.path, template], [destination.path, destination], [project.path, project]]);
   const caches = new Map<string, { frontmatter: Record<string, unknown> }>([
     [source.path, { frontmatter: { todo: true } }],
   ]);
@@ -43,7 +45,7 @@ function fixture() {
   const tasks = new Map<string, TaskNote>();
   const api: TaskNotesApi = {
     apiVersion: 1, hasCapability: () => true, lifecycle: { ready: async () => {} },
-    settings: { snapshot: () => ({ tasksFolder: "{{projectFolder}}/Tasks" }) },
+    settings: { snapshot: () => ({ fieldMapping: { projects: "projects" }, taskCreationDefaults: { useBodyTemplate: true, bodyTemplate: "Templates/_Task" } }) },
     tasks: {
       get: async (path) => tasks.get(path) ?? null,
       create: vi.fn(async (input) => {
@@ -58,7 +60,16 @@ function fixture() {
         const task = { ...tasks.get(path)!, archived };
         tasks.set(path, task); return task;
       }),
-      move: vi.fn(async (path) => tasks.get(path)!),
+      move: vi.fn(async (path, folder) => {
+        const nextPath = `${folder}/${path.split("/").pop()}`;
+        const task = { ...tasks.get(path)!, path: nextPath };
+        const moved = files.get(path) as TFile;
+        moved.path = nextPath;
+        files.delete(path); files.set(nextPath, moved);
+        caches.set(nextPath, caches.get(path)!); caches.delete(path);
+        tasks.delete(path); tasks.set(nextPath, task);
+        return task;
+      }),
     },
   };
   const app = {
@@ -90,6 +101,59 @@ function fixture() {
 beforeEach(() => { state.data = {}; state.notices = []; });
 
 describe("Obsidian event integration", () => {
+  it("repairs the old folder value to the explicitly selected Review project", async () => {
+    state.data = { propertyName: "todo", projectNotePath: "Projects/Review/Tasks" };
+    const f = fixture();
+    await f.plugin.onload();
+    expect(f.plugin.settings.taskFolderPath).toBe("Projects/Review/Tasks");
+    expect(f.plugin.settings.projectNotePath).toBe("Projects/Review/Review.md");
+    f.emit(); await f.drain();
+    expect(f.api.tasks.create).toHaveBeenCalledTimes(1);
+    expect(f.api.tasks.create).toHaveBeenCalledWith(expect.objectContaining({ projects: ["[[Projects/Review/Review]]"] }), expect.anything());
+    expect(state.notices).toEqual([]);
+  });
+
+  it("uses the selected existing project and creates only its missing Tasks folder", async () => {
+    const f = fixture();
+    f.files.set("Projects/Other/Anchor.md", file("Projects/Other/Anchor.md"));
+    await f.plugin.onload();
+    await f.plugin.updateSettings({ projectNotePath: "Projects/Other/Anchor.md" });
+    f.emit(); await f.drain();
+    expect(f.files.get("Projects/Other/Tasks")).toBeInstanceOf(TFolder);
+    expect(state.data.taskNoteRecords).toEqual([expect.objectContaining({ taskPath: "Projects/Other/Tasks/202610061500.md", taskFolder: "Projects/Other/Tasks" })]);
+    expect(f.api.tasks.create).toHaveBeenCalledWith(expect.objectContaining({ projects: ["[[Projects/Other/Anchor]]"] }), expect.anything());
+    expect(f.files.has("Projects/Other/Other.md")).toBe(false);
+    expect(state.notices).toEqual([]);
+  });
+
+  it("refuses a missing project rather than creating a projectless task", async () => {
+    const f = fixture();
+    f.files.delete("Projects/Review/Review.md");
+    await f.plugin.onload();
+    const errors = vi.spyOn(console, "error").mockImplementation(() => {});
+    f.emit(); await f.drain();
+    expect(f.api.tasks.create).not.toHaveBeenCalled();
+    expect(state.notices[0]).toContain("existing project note");
+    errors.mockRestore();
+  });
+
+  it("preserves an explicitly cleared project selection after reload", async () => {
+    state.data = { projectNotePath: "", taskFolderPath: "Projects/Review/Tasks" };
+    const f = fixture();
+    await f.plugin.onload();
+    expect(f.plugin.settings.projectNotePath).toBe("");
+  });
+
+  it("reports a missing _Task template without creating any task", async () => {
+    const f = fixture();
+    f.files.delete("Templates/_Task.md");
+    await f.plugin.onload();
+    const errors = vi.spyOn(console, "error").mockImplementation(() => {});
+    f.emit(); await f.drain();
+    expect(f.api.tasks.create).not.toHaveBeenCalled();
+    expect(state.notices[0]).toContain("Templates/_Task.md");
+    errors.mockRestore();
+  });
   it("does not bulk create at startup; serializes repeated checks and ignores generated-note events", async () => {
     const f = fixture();
     await f.plugin.onload();
@@ -112,7 +176,7 @@ describe("Obsidian event integration", () => {
     state.data = structuredClone(legacy);
     const f = fixture();
     await f.plugin.onload();
-    await f.plugin.updateSettings({ projectNotePath: "Projects/Review/Review.md" });
+    await f.plugin.updateSettings({ taskFolderPath: "Projects/Review/Tasks" });
     expect(state.data).toMatchObject(legacy);
     f.source.path = "Templates/Example.md";
     f.files.set(f.source.path, f.source);

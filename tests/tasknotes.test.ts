@@ -1,6 +1,6 @@
 import { describe, expect, it, vi } from "vitest";
 import {
-  assertCreationFolder, notePath, projectTaskFolder, renamedPath, requireTaskNotesApi,
+  assertTaskTemplate, folderPath, migrateTaskFolder, renamedPath, requireTaskNotesApi,
   sourceLink, synchronizeTaskNote, type TaskNote, type TaskNoteHost, type TaskNotesApi,
 } from "../src/tasknotes";
 
@@ -13,7 +13,7 @@ function fixture() {
   const api: TaskNotesApi = {
     apiVersion: 1, hasCapability: () => true,
     lifecycle: { ready: vi.fn(async () => {}) },
-    settings: { snapshot: () => ({ tasksFolder: "{{projectFolder}}/Tasks" }) },
+    settings: { snapshot: () => ({ fieldMapping: { projects: "projects" }, taskCreationDefaults: { useBodyTemplate: true, bodyTemplate: "Templates/_Task" } }) },
     tasks: {
       get: vi.fn(async (path) => tasks.get(path) ?? null),
       create: vi.fn(async () => {
@@ -37,12 +37,31 @@ function fixture() {
   const host: TaskNoteHost = {
     records: [], save: vi.fn(async () => {}), fileExists: (path) => files.has(path),
     findTask: vi.fn(async () => null), ensureFolder: vi.fn(async () => {}),
-    prepareProject: vi.fn(async () => ({ path: "Projects/Review/Review.md", folder })),
+    prepareTaskFolder: vi.fn(async () => folder),
+    projectLink: () => "[[Projects/Review/Review]]",
   };
   return { api, host, tasks, files };
 }
 
 describe("native TaskNotes synchronization", () => {
+  it("restores using the actual moved file path when TaskNotes returns a stale archive path", async () => {
+    const { api, host, tasks, files } = fixture();
+    await synchronizeTaskNote(api, host, source, true);
+    await synchronizeTaskNote(api, host, source, false);
+    let actualPath = host.records[0].taskPath;
+    host.watchTaskPath = () => () => actualPath;
+    api.tasks.archive = vi.fn(async (path) => {
+      const before = tasks.get(path)!;
+      actualPath = "Tasks/202610061400.md";
+      tasks.delete(path); files.delete(path);
+      tasks.set(actualPath, { ...before, path: actualPath, archived: false }); files.add(actualPath);
+      return { ...before, archived: false }; // TaskNotes' stale returned path.
+    });
+    await synchronizeTaskNote(api, host, source, true);
+    expect(api.tasks.move).toHaveBeenCalledWith("Tasks/202610061400.md", folder, expect.anything());
+    expect(host.records[0].taskPath).toBe(`${folder}/202610061400.md`);
+    expect(api.tasks.create).toHaveBeenCalledTimes(1);
+  });
   it("creates a linked task with logical project fields and TaskNotes defaults", async () => {
     const { api, host } = fixture();
     await synchronizeTaskNote(api, host, source, true);
@@ -50,9 +69,10 @@ describe("native TaskNotes synchronization", () => {
     expect(api.tasks.create).toHaveBeenCalledWith({
       title: "Example", details: "[[Library/Example|Example]]",
       projects: ["[[Projects/Review/Review]]"],
-      customFrontmatter: { taskifySource: "[[Library/Example|Example]]" },
+      customFrontmatter: { projects: ["[[Projects/Review/Review]]"], taskifySource: "[[Library/Example|Example]]" },
     }, expect.objectContaining({ source: "taskify", reason: "Source checkbox checked" }));
     expect(host.records).toEqual([{ sourcePath: source.path, taskPath: `${folder}/202610061400.md`, taskFolder: folder }]);
+    expect(api.tasks.move).not.toHaveBeenCalled();
   });
 
   it("does not duplicate tasks on repeated note updates or after restoring persisted records", async () => {
@@ -91,7 +111,7 @@ describe("native TaskNotes synchronization", () => {
     await synchronizeTaskNote(api, host, source, false);
     expect(api.tasks.create).not.toHaveBeenCalled();
     expect(api.tasks.archive).not.toHaveBeenCalled();
-    expect(host.prepareProject).not.toHaveBeenCalled();
+    expect(host.prepareTaskFolder).not.toHaveBeenCalled();
   });
 
   it("does not undo a user's manual move of an active task on a source-note edit", async () => {
@@ -122,10 +142,10 @@ describe("native TaskNotes synchronization", () => {
     expect(api.tasks.create).not.toHaveBeenCalled();
   });
 
-  it("refuses an incompatible folder before task creation", async () => {
+  it("refuses a different template before task creation", async () => {
     const { api, host } = fixture();
-    api.settings.snapshot = () => ({ tasksFolder: "Tasks" });
-    await expect(synchronizeTaskNote(api, host, source, true)).rejects.toThrow("task folder");
+    api.settings.snapshot = () => ({ fieldMapping: { projects: "projects" }, taskCreationDefaults: { useBodyTemplate: true, bodyTemplate: "Templates/Other" } });
+    await expect(synchronizeTaskNote(api, host, source, true)).rejects.toThrow("Templates/_Task.md");
     expect(api.tasks.create).not.toHaveBeenCalled();
   });
 
@@ -137,12 +157,37 @@ describe("native TaskNotes synchronization", () => {
     expect(api.tasks.create).toHaveBeenCalledTimes(1);
   });
 
-  it("tracks an unexpectedly placed task before reporting the folder error", async () => {
+  it("writes the selected project using the live mapped property, not a null template default", async () => {
     const { api, host } = fixture();
-    api.tasks.create = vi.fn(async () => ({ path: "Other/new.md", status: "open", archived: false }));
-    await expect(synchronizeTaskNote(api, host, source, true)).rejects.toThrow("outside");
-    expect(host.records[0].taskPath).toBe("Other/new.md");
+    api.settings.snapshot = () => ({ fieldMapping: { projects: "project_links" }, taskCreationDefaults: { useBodyTemplate: true, bodyTemplate: "Templates/_Task" } });
+    await synchronizeTaskNote(api, host, source, true);
+    expect(api.tasks.create).toHaveBeenCalledWith(expect.objectContaining({ customFrontmatter: { project_links: ["[[Projects/Review/Review]]"], taskifySource: "[[Library/Example|Example]]" } }), expect.anything());
+  });
+
+  it("moves the native task from TaskNotes' creation folder to the selected folder", async () => {
+    const { api, host, tasks, files } = fixture();
+    api.tasks.create = vi.fn(async () => {
+      const task = { path: "Other/new.md", status: "open", archived: false };
+      tasks.set(task.path, task); files.add(task.path); return task;
+    });
+    await synchronizeTaskNote(api, host, source, true);
+    expect(api.tasks.move).toHaveBeenCalledWith("Other/new.md", folder, expect.anything());
+    expect(host.records[0].taskPath).toBe(`${folder}/new.md`);
     expect(host.save).toHaveBeenCalled();
+  });
+
+  it("tracks a creation before a failed placement and retries placement without a duplicate", async () => {
+    const { api, host } = fixture();
+    host.prepareTaskFolder = async () => "Review Tasks";
+    const move = api.tasks.move;
+    api.tasks.move = vi.fn(async () => { throw new Error("Collision"); });
+    await expect(synchronizeTaskNote(api, host, source, true)).rejects.toThrow("Collision");
+    expect(host.records[0].restorePending).toBe(true);
+    api.tasks.move = move;
+    await synchronizeTaskNote(api, host, source, true);
+    expect(api.tasks.create).toHaveBeenCalledTimes(1);
+    expect(host.records[0].taskPath).toBe("Review Tasks/202610061400.md");
+    expect(host.records[0].restorePending).toBe(false);
   });
 
   it("retains the unarchive path when the return move fails, then retries without creating a duplicate", async () => {
@@ -170,16 +215,26 @@ describe("API and path guards", () => {
   });
   it("rejects traversal, absolute paths and link-shaped paths", () => {
     for (const path of ["../Review", "/Review", "Projects/../Review", "[[Review]]", "Review#Heading", "Projects//Review"]) {
-      expect(() => notePath(path)).toThrow();
+      expect(() => folderPath(path)).toThrow();
     }
-    expect(notePath("Projects/Review/Review")).toBe("Projects/Review/Review.md");
-    expect(projectTaskFolder("Projects/Review/Review.md")).toBe(folder);
-    expect(() => projectTaskFolder("Review.md")).toThrow();
+    expect(folderPath("Projects/Review/Tasks/")).toBe(folder);
+    expect(folderPath("Tasks")).toBe("Tasks");
   });
-  it("accepts the exact project folder without guessing other template variables", () => {
-    expect(() => assertCreationFolder("{{projectFolder}}/Tasks", "Projects/Review/Review.md")).not.toThrow();
-    expect(() => assertCreationFolder(folder, "Projects/Review/Review.md")).not.toThrow();
-    expect(() => assertCreationFolder("{{projectFolder}}/{{status}}", "Projects/Review/Review.md")).toThrow();
+  it("requires the enabled exact _Task template with or without the extension", () => {
+    expect(() => assertTaskTemplate({ useBodyTemplate: true, bodyTemplate: "Templates/_Task" })).not.toThrow();
+    expect(() => assertTaskTemplate({ useBodyTemplate: true, bodyTemplate: "Templates/_Task.md" })).not.toThrow();
+    expect(() => assertTaskTemplate({ useBodyTemplate: false, bodyTemplate: "Templates/_Task" })).toThrow();
+    expect(() => assertTaskTemplate({ useBodyTemplate: true, bodyTemplate: "Templates/_Tasks" })).toThrow();
+  });
+  it("migrates verified old folder or project-note settings without guessing nonexistent paths", () => {
+    const kind = (path: string) => path === folder ? "folder" as const : path === "Projects/Review/Review.md" ? "file" as const : null;
+    expect(migrateTaskFolder({ projectNotePath: folder }, kind)).toBe(folder);
+    expect(migrateTaskFolder({ projectNotePath: `${folder}.md` }, kind)).toBe(folder);
+    expect(migrateTaskFolder({ projectNotePath: "Projects/Review/Review.md" }, kind)).toBe(folder);
+    expect(migrateTaskFolder({ projectNotePath: "Missing/Project.md" }, kind)).toBe("");
+    expect(migrateTaskFolder({ projectNotePath: "../Outside" }, kind)).toBe("");
+    expect(migrateTaskFolder({ projectNotePath: "" }, kind)).toBe("");
+    expect(migrateTaskFolder({ taskFolderPath: "Chosen/Folder", projectNotePath: folder }, kind)).toBe("Chosen/Folder");
   });
   it("qualifies same-title links and tracks note and folder renames without prefix collisions", () => {
     expect(sourceLink("Other/Example.md", "Example")).toBe("[[Other/Example|Example]]");

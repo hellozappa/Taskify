@@ -1,7 +1,7 @@
 import { Notice, Plugin, TAbstractFile, TFile, TFolder } from "obsidian";
 import { DEFAULT_SETTINGS, TaskifySettingTab, type TaskifySettings } from "./settings";
 import {
-  notePath, projectTaskFolder, renamedPath, requireTaskNotesApi, synchronizeTaskNote,
+  folderPath, migrateTaskFolder, TASK_TEMPLATE_PATH, renamedPath, requireTaskNotesApi, synchronizeTaskNote,
   type TaskNoteRecord, type TaskNotesApi,
 } from "./tasknotes";
 
@@ -52,6 +52,7 @@ export default class TaskifyPlugin extends Plugin {
 
   async updateSettings(changes: Partial<TaskifySettings>): Promise<void> {
     this.settings = { ...this.settings, ...changes };
+    if (changes.projectNotePath !== undefined) this.settings.taskFolderPath = this.projectTaskFolder();
     await this.savePluginData();
   }
 
@@ -88,8 +89,16 @@ export default class TaskifyPlugin extends Plugin {
       save: () => this.savePluginData(),
       fileExists: (path) => this.app.vault.getAbstractFileByPath(path) instanceof TFile,
       findTask: (path) => this.findTaskBySource(api, path),
-      prepareProject: () => this.prepareProject(),
+      prepareTaskFolder: () => this.prepareTaskFolder(),
+      projectLink: () => `[[${this.settings.projectNotePath.replace(/\.md$/, "")}]]`,
       ensureFolder: (path) => this.ensureFolder(path),
+      watchTaskPath: (path) => {
+        const taskFile = this.app.vault.getAbstractFileByPath(path);
+        if (!isMarkdownFile(taskFile)) throw new Error(`Task file not found: ${path}`);
+        // Obsidian updates this object's path even if TaskNotes returns a stale
+        // archive path after moving to a project-template fallback folder.
+        return () => taskFile.path;
+      },
     }, { path: file.path, title: file.basename }, value);
   }
 
@@ -101,7 +110,7 @@ export default class TaskifyPlugin extends Plugin {
     if (!await api.tasks.get(file.path)) {
       throw new Error(`TaskNotes has not indexed ${file.path}; no duplicate was created.`);
     }
-    const taskFolder = projectTaskFolder(notePath(this.settings.projectNotePath));
+    const taskFolder = folderPath(this.settings.taskFolderPath);
     return { sourcePath, taskPath: file.path, taskFolder };
   }
 
@@ -119,19 +128,28 @@ export default class TaskifyPlugin extends Plugin {
     return matches;
   }
 
-  private async prepareProject(): Promise<{ path: string; folder: string }> {
-    const path = notePath(this.settings.projectNotePath);
-    const project = this.app.vault.getAbstractFileByPath(path);
-    if (!isMarkdownFile(project)) throw new Error(`Create/select the existing project note ${path} in Taskify settings first.`);
-    const folder = projectTaskFolder(path);
+  private async prepareTaskFolder(): Promise<string> {
+    if (!isMarkdownFile(this.app.vault.getAbstractFileByPath(TASK_TEMPLATE_PATH))) {
+      throw new Error(`The required task template ${TASK_TEMPLATE_PATH} is missing.`);
+    }
+    const project = this.app.vault.getAbstractFileByPath(this.settings.projectNotePath);
+    if (!isMarkdownFile(project) || isTemplateFile(project)) {
+      throw new Error("Select an existing project note in Taskify settings first (for Review, Projects/Review/Review.md). A folder is not a project note.");
+    }
+    const folder = this.projectTaskFolder();
     await this.ensureFolder(folder);
-    return { path, folder };
+    return folder;
+  }
+
+  private projectTaskFolder(): string {
+    const path = this.settings.projectNotePath;
+    const slash = path.lastIndexOf("/");
+    return slash < 0 ? "Tasks" : folderPath(`${path.slice(0, slash)}/Tasks`);
   }
 
   private async ensureFolder(path: string): Promise<void> {
     // Validate before creating folders; tracking records are persisted user data.
-    const validated = notePath(`${path}/folder-validation.md`);
-    if (!validated.endsWith("/folder-validation.md")) throw new Error("Invalid task folder.");
+    path = folderPath(path);
     let current = "";
     for (const part of path.split("/")) {
       current = current ? `${current}/${part}` : part;
@@ -149,9 +167,14 @@ export default class TaskifyPlugin extends Plugin {
         if (next !== record[key]) { record[key] = next; changed = true; }
       }
     }
-    const projectPath = renamedPath(this.settings.projectNotePath, oldPath, file.path);
-    if (projectPath !== this.settings.projectNotePath) {
-      this.settings.projectNotePath = projectPath;
+    const destination = renamedPath(this.settings.taskFolderPath, oldPath, file.path);
+    if (destination !== this.settings.taskFolderPath) {
+      this.settings.taskFolderPath = destination;
+      changed = true;
+    }
+    const project = renamedPath(this.settings.projectNotePath, oldPath, file.path);
+    if (project !== this.settings.projectNotePath) {
+      this.settings.projectNotePath = project;
       changed = true;
     }
     if (changed) await this.savePluginData();
@@ -161,9 +184,26 @@ export default class TaskifyPlugin extends Plugin {
     this.storedData = (await this.loadData()) as StoredPluginData | null ?? {};
     this.settings = {
       propertyName: this.storedData.propertyName === "task" ? "task" : "todo",
-      projectNotePath: typeof this.storedData.projectNotePath === "string"
-        ? this.storedData.projectNotePath : DEFAULT_SETTINGS.projectNotePath,
+      taskFolderPath: migrateTaskFolder(this.storedData, (path) => {
+        const file = this.app.vault.getAbstractFileByPath(path);
+        return file instanceof TFolder ? "folder" : file instanceof TFile ? "file" : null;
+      }),
+      projectNotePath: "",
     };
+    const savedProject = typeof this.storedData.projectNotePath === "string"
+      ? this.storedData.projectNotePath.replace(/\.md$/, "") + ".md" : "";
+    if (isMarkdownFile(this.app.vault.getAbstractFileByPath(savedProject))) {
+      this.settings.projectNotePath = savedProject;
+    } else if ((this.storedData.projectNotePath === undefined ||
+      this.storedData.projectNotePath === DEFAULT_SETTINGS.taskFolderPath ||
+      this.storedData.projectNotePath === `${DEFAULT_SETTINGS.taskFolderPath}.md`) &&
+      this.settings.taskFolderPath === DEFAULT_SETTINGS.taskFolderPath &&
+      isMarkdownFile(this.app.vault.getAbstractFileByPath(DEFAULT_SETTINGS.projectNotePath))) {
+      // Review was explicitly selected for this integration; never infer a
+      // different project from a folder's name or arbitrary note ordering.
+      this.settings.projectNotePath = DEFAULT_SETTINGS.projectNotePath;
+    }
+    if (this.settings.projectNotePath) this.settings.taskFolderPath = this.projectTaskFolder();
     this.records = Array.isArray(this.storedData.taskNoteRecords)
       ? this.storedData.taskNoteRecords.filter((record) =>
         typeof record?.sourcePath === "string" && typeof record?.taskPath === "string" &&

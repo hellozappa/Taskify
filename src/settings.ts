@@ -3,11 +3,13 @@ import type TaskifyPlugin from "./main";
 
 export type TaskifySettings = {
   propertyName: "task" | "todo";
+  taskFolderPath: string;
   projectNotePath: string;
 };
 
 export const DEFAULT_SETTINGS: TaskifySettings = {
   propertyName: "todo",
+  taskFolderPath: "Projects/Review/Tasks",
   projectNotePath: "Projects/Review/Review.md",
 };
 
@@ -25,12 +27,17 @@ export class TaskifySettingTab extends PluginSettingTab {
           if (value === "todo" || value === "task") await this.plugin.updateSettings({ propertyName: value });
         }));
     new Setting(containerEl).setName("Project note")
-      .setDesc("Exact vault-relative path to an existing project note. Tasks are created in that project's Tasks subfolder.")
-      .addText((text) => text.setPlaceholder("Projects/Review/Review.md")
-        .setValue(this.plugin.settings.projectNotePath).onChange(async (value) => {
-          await this.plugin.updateSettings({ projectNotePath: value.trim() });
-        }));
-    containerEl.createEl("p", { text: "Requires TaskNotes runtime API v1 (tested with 4.13.8). In TaskNotes, set the task folder to {{projectFolder}}/Tasks. Taskify uses TaskNotes' template, filename, status, priority, and date defaults." });
+      .setDesc("Select the existing note that identifies the project. Tasks link to this note and are stored in its folder's Tasks subfolder. No task-store file is required.")
+      .addDropdown((dropdown) => {
+        dropdown.addOption("", "Select a project note");
+        for (const file of this.app.vault.getMarkdownFiles().filter((file) => !file.path.split("/").some((part) => part.toLowerCase() === "templates")).sort((a, b) => a.path.localeCompare(b.path))) {
+          dropdown.addOption(file.path, file.path);
+        }
+        dropdown.setValue(this.plugin.settings.projectNotePath).onChange(async (value) => {
+          await this.plugin.updateSettings({ projectNotePath: value });
+        });
+      });
+    containerEl.createEl("p", { text: "Requires TaskNotes runtime API v1 (tested with 4.13.8). Enable its body template Templates/_Task.md and use {{projectFolder}}/Tasks as its task-folder setting. Taskify passes the selected project to TaskNotes and verifies placement without changing TaskNotes settings." });
     containerEl.createEl("p", { text: "Manage completion and custom statuses such as Read in TaskNotes settings. Taskify does not change completion statuses or the source checkbox when a task is completed." });
     containerEl.createEl("p", { text: "Archive behavior follows TaskNotes' archive settings, including any archive-folder movement. Existing checklist files and legacy Taskify settings are preserved but are no longer used." });
   }

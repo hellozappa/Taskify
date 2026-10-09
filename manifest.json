@@ -1,7 +1,7 @@
 {
   "id": "taskify",
   "name": "Taskify",
-  "version": "0.2.0",
+  "version": "0.2.1",
   "minAppVersion": "1.12.2",
   "description": "Creates native TaskNotes tasks from a configurable note checkbox.",
   "author": "Chris Zappa",
